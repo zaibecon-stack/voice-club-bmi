@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VOICE CLUB BMI CALCULATOR</title>
+    <!-- Load Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Define a custom font and background for the PWA */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f4f7f9;
+        }
+    </style>
+
+    <!-- PWA and Firebase SDK Imports -->
+    <link rel="manifest" href="manifest.json">
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, onSnapshot, collection, query, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Set Firestore debug logging
+        setLogLevel('debug');
+        
+        // --- MANDATORY FIREBASE SETUP ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false;
+
+        // Initialize Firebase app
+        const app = initializeApp(firebaseConfig);
+        db = getFirestore(app);
+        auth = getAuth(app);
+
+        // Global variables for access in the script scope
+        window.db = db;
+        window.auth = auth;
+        window.getFirestore = getFirestore; // Expose needed functions
+
+        // Authentication and Initialization
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                userId = user.uid;
+                document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                isAuthReady = true;
+                console.log("Firebase Auth Ready. User ID:", userId);
+                window.loadHistory(); // Load history once authenticated
+            } else {
+                // If no user, sign in
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (error) {
+                    console.error("Firebase Sign-in failed:", error);
+                    document.getElementById('status-box').textContent = "❌ Auth Failed. Check console.";
+                }
+            }
+        });
+
+        // --- FIRESTORE LOGIC ---
+        
+        // Function to save the calculation
+        window.saveCalculation = async () => {
+            if (!isAuthReady || !userId) {
+                console.error("Auth not ready. Cannot save.");
+                document.getElementById('message-box').innerHTML = '<p class="text-red-600">Please wait for the app to finish loading (Auth not ready).</p>';
+                return;
+            }
+
+            const name = document.getElementById('name').value.trim();
+            const age = parseInt(document.getElementById('age').value);
+            const gender = document.getElementById('gender').value;
+            const heightCm = parseFloat(document.getElementById('height_cm').value);
+            const heightFeet = parseFloat(document.getElementById('height_ft').value);
+            const heightInches = parseFloat(document.getElementById('height_in').value);
+            const weightKg = parseFloat(document.getElementById('weight_kg').value);
+
+            if (!name || isNaN(age) || age <= 0 || isNaN(weightKg) || weightKg <= 0) {
+                document.getElementById('message-box').innerHTML = '<p class="text-red-600">Please fill in Name, Age, and valid Weight.</p>';
+                return;
+            }
+
+            // Determine height in meters, prioritizing feet/inches
+            let heightM = 0;
+            let heightSource = "";
+            
+            if (!isNaN(heightFeet) && !isNaN(heightInches)) {
+                // Convert Feet and Inches to Meters
+                const totalInches = (heightFeet * 12) + heightInches;
+                heightM = totalInches * 0.0254; // 1 inch = 0.0254 meters
+                heightSource = `${heightFeet}ft ${heightInches}in`;
+            } else if (!isNaN(heightCm)) {
+                // Convert CM to Meters
+                heightM = heightCm / 100;
+                heightSource = `${heightCm}cm`;
+            } else {
+                document.getElementById('message-box').innerHTML = '<p class="text-red-600">Please enter a valid Height (in Ft/In or CM).</p>';
+                return;
+            }
+            
+            // Calculate BMI
+            const bmi = (weightKg / (heightM * heightM)).toFixed(1);
+            let category = getBmiCategory(bmi);
+            
+            const calculationData = {
+                userId: userId,
+                name: name,
+                age: age,
+                gender: gender,
+                weightKg: weightKg,
+                heightM: heightM,
+                heightSource: heightSource,
+                bmi: bmi,
+                category: category,
+                timestamp: serverTimestamp()
+            };
+
+            try {
+                const historyCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/bmi_history`);
+                await addDoc(historyCollectionRef, calculationData);
+                document.getElementById('message-box').innerHTML = `<p class="text-green-600">✅ Calculation for **${name}** (BMI: ${bmi}) saved successfully!</p>`;
+                
+                // Clear inputs after save (optional)
+                document.getElementById('name').value = '';
+                document.getElementById('age').value = '';
+                document.getElementById('height_cm').value = '';
+                document.getElementById('height_ft').value = '';
+                document.getElementById('height_in').value = '';
+                document.getElementById('weight_kg').value = '';
+
+                // Automatically switch to history view to see the result
+                window.showView('history-view');
+
+            } catch (e) {
+                console.error("Error adding document: ", e);
+                document.getElementById('message-box').innerHTML = `<p class="text-red-600">❌ Error saving data: ${e.message}</p>`;
+            }
+        };
+
+        // Function to load and display history
+        window.loadHistory = () => {
+            if (!isAuthReady || !userId) {
+                console.log("Waiting for auth to load history...");
+                return;
+            }
+            
+            const historyList = document.getElementById('history-list');
+            historyList.innerHTML = '<p class="text-center text-gray-500">Loading history...</p>';
+
+            const historyCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/bmi_history`);
+            const q = query(historyCollectionRef); // Note: Sorting is done client-side to avoid Firestore index complexity
+
+            // Set up real-time listener
+            onSnapshot(q, (snapshot) => {
+                let history = [];
+                snapshot.forEach(doc => {
+                    history.push({ id: doc.id, ...doc.data() });
+                });
+
+                // Sort the history by timestamp (descending) in JavaScript
+                history.sort((a, b) => (b.timestamp?.toMillis() || 0) - (a.timestamp?.toMillis() || 0));
+
+                if (history.length === 0) {
+                    historyList.innerHTML = '<p class="text-center text-gray-500 p-4">No calculation history found yet.</p>';
+                    return;
+                }
+
+                historyList.innerHTML = '';
+                history.forEach(item => {
+                    const date = item.timestamp ? new Date(item.timestamp.seconds * 1000).toLocaleString() : 'N/A';
+                    const categoryClass = getCategoryClass(item.category);
+                    
+                    historyList.innerHTML += `
+                        <div class="p-4 bg-white rounded-lg shadow-sm mb-3 border-l-4 ${categoryClass.border}">
+                            <div class="flex justify-between items-start">
+                                <p class="text-lg font-bold text-gray-800">${item.name} <span class="text-sm font-medium text-gray-500">(${item.age}, ${item.gender})</span></p>
+                                <p class="text-sm text-gray-500">${date}</p>
+                            </div>
+                            <div class="flex justify-between items-center mt-2">
+                                <p class="text-4xl font-extrabold ${categoryClass.text}">${item.bmi}</p>
+                                <p class="text-md font-semibold ${categoryClass.text}">${item.category}</p>
+                            </div>
+                            <p class="text-xs text-gray-400 mt-1">Height: ${item.heightSource}, Weight: ${item.weightKg}kg</p>
+                        </div>
+                    `;
+                });
+            }, (error) => {
+                console.error("Error loading history: ", error);
+                historyList.innerHTML = `<p class="text-center text-red-500 p-4">Error loading history: ${error.message}</p>`;
+            });
+        };
+        
+        // Helper function for BMI categories
+        function getBmiCategory(bmi) {
+            if (bmi < 18.5) return "Underweight";
+            if (bmi >= 18.5 && bmi < 25) return "Normal (Healthy Weight)";
+            if (bmi >= 25 && bmi < 30) return "Overweight";
+            return "Obese";
+        }
+
+        // Helper function for history card styling
+        function getCategoryClass(category) {
+            switch (category) {
+                case "Underweight": return { text: "text-yellow-600", border: "border-yellow-500" };
+                case "Normal (Healthy Weight)": return { text: "text-green-600", border: "border-green-500" };
+                case "Overweight": return { text: "text-orange-600", border: "border-orange-500" };
+                case "Obese": return { text: "text-red-600", border: "border-red-500" };
+                default: return { text: "text-gray-600", border: "border-gray-500" };
+            }
+        }
+        
+    </script>
+
+</head>
+<body class="bg-gray-100 min-h-screen flex items-start justify-center p-4">
+
+    <!-- Main App Container -->
+    <div class="w-full max-w-lg bg-white shadow-xl rounded-2xl p-6 md:p-8 mt-4">
+        <header class="text-center mb-6">
+            <h1 class="text-3xl font-extrabold text-indigo-700">VOICE CLUB BMI CALCULATOR</h1>
+            <p class="text-gray-500">Enter details to save your BMI to history.</p>
+        </header>
+
+        <!-- Navigation Tabs -->
+        <div class="flex border-b border-gray-200 mb-6">
+            <button onclick="showView('calculator-view')" id="tab-calculator" class="py-2 px-4 text-sm font-medium border-b-2 border-indigo-600 text-indigo-600 focus:outline-none transition duration-150">
+                Calculator
+            </button>
+            <button onclick="showView('history-view')" id="tab-history" class="py-2 px-4 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-indigo-600 hover:border-indigo-300 focus:outline-none transition duration-150">
+                History
+            </button>
+        </div>
+
+        <!-- Message Box for Success/Error -->
+        <div id="message-box" class="p-3 mb-4 rounded-lg bg-indigo-50 text-sm font-medium hidden"></div>
+
+        <!-- CALCULATOR VIEW -->
+        <div id="calculator-view" class="space-y-6">
+            
+            <!-- Row 1: Name and Age -->
+            <div class="flex space-x-4">
+                <div class="flex-1">
+                    <label for="name" class="block text-sm font-medium text-gray-700 mb-2">Name</label>
+                    <input type="text" id="name" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150" placeholder="Your Name" required>
+                </div>
+                <div class="w-20">
+                    <label for="age" class="block text-sm font-medium text-gray-700 mb-2">Age</label>
+                    <input type="number" id="age" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150" placeholder="25" required>
+                </div>
+            </div>
+
+            <!-- Row 2: Gender -->
+            <div>
+                <label for="gender" class="block text-sm font-medium text-gray-700 mb-2">Gender</label>
+                <select id="gender" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150">
+                    <option value="Male">Male</option>
+                    <option value="Female">Female</option>
+                    <option value="Other">Other</option>
+                </select>
+            </div>
+
+            <!-- Row 3: Height (Feet & Inches) -->
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Height (Feet / Inches) - Primary</label>
+                <div class="flex space-x-4">
+                    <input type="number" id="height_ft" class="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500" placeholder="Feet (e.g., 5)">
+                    <input type="number" id="height_in" class="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500" placeholder="Inches (e.g., 9)">
+                </div>
+            </div>
+
+            <!-- Row 4: Height (CM) -->
+            <div>
+                <label for="height_cm" class="block text-sm font-medium text-gray-700 mb-2">Height (CM) - Secondary</label>
+                <input type="number" id="height_cm" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150" placeholder="e.g., 175">
+                <p class="text-xs text-gray-400 mt-1">If Feet/Inches are entered, CM will be ignored.</p>
+            </div>
+            
+            <!-- Row 5: Weight (KG) -->
+            <div>
+                <label for="weight_kg" class="block text-sm font-medium text-gray-700 mb-2">Weight (kg)</label>
+                <input type="number" id="weight_kg" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150" placeholder="e.g., 70" required>
+            </div>
+
+            <!-- Calculate Button (Now saves to history) -->
+            <button onclick="saveCalculation()" class="w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-700 transition duration-150 shadow-md hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-50">
+                Calculate & Save to History
+            </button>
+        </div>
+
+        <!-- HISTORY VIEW -->
+        <div id="history-view" class="hidden">
+            <h2 class="text-xl font-bold text-gray-700 mb-4">Calculation History</h2>
+            <div id="history-list" class="space-y-4">
+                <p class="text-center text-gray-500">Loading history...</p>
+            </div>
+        </div>
+
+        <!-- App Status (PWA/Firebase Info) -->
+        <footer class="mt-8 border-t pt-4 text-center">
+            <div id="status-box" class="p-2 rounded-lg text-xs font-medium text-center bg-yellow-100 text-yellow-700 mb-2">
+                PWA Loading...
+            </div>
+            <p id="user-id-display" class="text-xs text-gray-400">Loading User...</p>
+        </footer>
+    </div>
+
+<script>
+    // --- PWA Service Worker Registration (Same as before) ---
+    if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+            navigator.serviceWorker.register('/sw.js', { scope: './' })
+                .then(registration => {
+                    document.getElementById('status-box').className = "p-2 rounded-lg text-xs font-medium text-center bg-green-100 text-green-700 mb-2";
+                    document.getElementById('status-box').textContent = "✅ App Ready! Install to add to home screen.";
+                })
+                .catch(error => {
+                    document.getElementById('status-box').className = "p-2 rounded-lg text-xs font-medium text-center bg-red-100 text-red-700 mb-2";
+                    document.getElementById('status-box').textContent = "❌ SW Failed. Deploying to Netlify will fix this!";
+                    console.error('Service Worker registration failed:', error);
+                });
+        });
+    }
+    
+    // --- UI View Switching Logic ---
+    window.showView = (viewId) => {
+        const views = ['calculator-view', 'history-view'];
+        const tabs = ['tab-calculator', 'tab-history'];
+
+        // Hide all views and reset tabs
+        views.forEach(id => document.getElementById(id).classList.add('hidden'));
+        tabs.forEach(id => document.getElementById(id).classList.replace('border-indigo-600', 'border-transparent'));
+        tabs.forEach(id => document.getElementById(id).classList.replace('text-indigo-600', 'text-gray-500'));
+        
+        // Show the selected view and activate the tab
+        document.getElementById(viewId).classList.remove('hidden');
+        if (viewId === 'calculator-view') {
+            document.getElementById('tab-calculator').classList.replace('border-transparent', 'border-indigo-600');
+            document.getElementById('tab-calculator').classList.replace('text-gray-500', 'text-indigo-600');
+        } else if (viewId === 'history-view') {
+            document.getElementById('tab-history').classList.replace('border-transparent', 'border-indigo-600');
+            document.getElementById('tab-history').classList.replace('text-gray-500', 'text-indigo-600');
+            // Ensure history is loaded/refreshed when history view is activated
+            window.loadHistory(); 
+        }
+
+        // Show message box if content is present, otherwise hide
+        const msgBox = document.getElementById('message-box');
+        if (msgBox.innerHTML.trim() !== "") {
+            msgBox.classList.remove('hidden');
+        } else {
+            msgBox.classList.add('hidden');
+        }
+    }
+    
+    // Initial view load
+    window.showView('calculator-view'); 
+    
+</script>
+</body>
+</html>
